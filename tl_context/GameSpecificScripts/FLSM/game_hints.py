@@ -1,0 +1,229 @@
+"""
+FLSM-specific hints for add_context.py.
+
+The core doesn't know anything about this game's data conventions - it just
+asks build_hints() for three lookup tables and inserts them wherever a
+matching anchor (label, dict key, chat message text) turns up while walking
+context. Everything here is what would break on a different game:
+
+  - NAME_CATALOGUE = {"io-xxx": {...}, ...}
+    (interaction_character_options.rpy, interaction_location_options.rpy,
+     interaction_object_options.rpy)
+  - <someone>.interactions = [{LABEL: "...", ...}, ...]  (q_inter_*.rpy)
+  - the quest list, where CHAR_INTR: {"code": "io-id"} and
+    CHAT: {"code": "chat-key"} (including nested under OFFRAMP) are the only
+    place an interaction/chat gets tied to a character
+  - chat catalogues: <cat>["key"] = [{SENDER, CONTENT, CHOICES, ...}, ...]
+"""
+
+import ast
+import os
+import re
+
+CATALOGUE_ASSIGN_RE = re.compile(r'^\s*\w*CATALOGUE\s*=\s*\{')
+INTERACTIONS_ASSIGN_RE = re.compile(r'^\s*(?:\$\s+)?[\w\.\(\)"\'\s]*\.interactions\s*=\s*\[')
+CHAR_INTR_RE = re.compile(r'CHAR_INTR\s*:\s*\{\s*["\'](\w+)["\']\s*:\s*["\']([^"\']+)["\']\s*\}')
+CHAT_RE = re.compile(r'CHAT\s*:\s*\{\s*["\'](\w+)["\']\s*:\s*["\']([^"\']+)["\']\s*\}')
+CHAT_CATALOGUE_ASSIGN_RE = re.compile(r'^\s*\w+\[\s*["\'][^"\']+["\']\s*\]\s*=\s*\[\s*$')
+
+
+def _iter_rpy_files(source_root):
+    for root, dirs, files in os.walk(source_root):
+        dirs[:] = [d for d in dirs if d != 'tl']
+        for f in files:
+            if f.endswith(".rpy"):
+                yield os.path.join(root, f)
+
+
+def _read_lines(filepath, cache):
+    if filepath not in cache:
+        if not os.path.exists(filepath):
+            cache[filepath] = None
+        else:
+            with open(filepath, 'r', encoding='utf-8-sig') as f:
+                cache[filepath] = f.readlines()
+    return cache[filepath]
+
+
+def _node_to_str(node):
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Constant):
+        return str(node.value) if not isinstance(node.value, str) else node.value
+    if isinstance(node, (ast.List, ast.Tuple)):
+        inner = ", ".join(_node_to_str(e) for e in node.elts)
+        ob, cb = ("[", "]") if isinstance(node, ast.List) else ("(", ")")
+        return f"{ob}{inner}{cb}"
+    if isinstance(node, ast.Dict):
+        parts = [f"{_node_to_str(k)}: {_node_to_str(v)}" for k, v in zip(node.keys, node.values) if k is not None]
+        return "{" + ", ".join(parts) + "}"
+    if isinstance(node, ast.Attribute):
+        return f"{_node_to_str(node.value)}.{node.attr}"
+    if isinstance(node, ast.Call):
+        return f"{_node_to_str(node.func)}({', '.join(_node_to_str(a) for a in node.args)})"
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return f"-{_node_to_str(node.operand)}"
+    return ast.dump(node)
+
+
+def _collect_bracketed_chunk(lines, start_idx):
+    chunk, depth, opened, i = [], 0, False, start_idx
+    while i < len(lines):
+        chunk.append(lines[i])
+        for ch in lines[i]:
+            if ch in "[{":
+                depth += 1
+                opened = True
+            elif ch in "]}":
+                depth -= 1
+        i += 1
+        if opened and depth <= 0:
+            break
+    return chunk, i
+
+
+def build_catalogue_conditions(source_root, lines_cache=None):
+    """id -> "FIELD=val, FIELD=val" for CATALOGUE dicts and .interactions lists."""
+    if lines_cache is None:
+        lines_cache = {}
+    conditions = {}
+
+    for path in _iter_rpy_files(source_root):
+        lines = _read_lines(path, lines_cache)
+        if not lines:
+            continue
+
+        i = 0
+        while i < len(lines):
+            is_catalogue = CATALOGUE_ASSIGN_RE.match(lines[i])
+            is_interactions = INTERACTIONS_ASSIGN_RE.match(lines[i])
+            if not (is_catalogue or is_interactions):
+                i += 1
+                continue
+
+            chunk, i = _collect_bracketed_chunk(lines, i)
+            rhs = "".join(chunk).split('=', 1)[1]
+            try:
+                tree = ast.parse(rhs.strip(), mode='eval')
+            except SyntaxError:
+                continue
+
+            if is_catalogue and isinstance(tree.body, ast.Dict):
+                for k, v in zip(tree.body.keys, tree.body.values):
+                    if k is None or not isinstance(v, ast.Dict):
+                        continue
+                    entry_id = _node_to_str(k)
+                    extras = [f"{_node_to_str(fk)}={_node_to_str(fv)}" for fk, fv in zip(v.keys, v.values)
+                              if fk is not None and _node_to_str(fk) != "NAME"]
+                    if extras:
+                        conditions[entry_id] = ", ".join(extras)
+
+            elif is_interactions and isinstance(tree.body, ast.List):
+                for item in tree.body.elts:
+                    if not isinstance(item, ast.Dict):
+                        continue
+                    label, extras = None, []
+                    for k, v in zip(item.keys, item.values):
+                        if k is None:
+                            continue
+                        kname = _node_to_str(k)
+                        if kname == "LABEL":
+                            label = _node_to_str(v)
+                        else:
+                            extras.append(f"{kname}={_node_to_str(v)}")
+                    if label and extras:
+                        conditions[label] = ", ".join(extras)
+
+    return conditions
+
+
+def build_character_index(source_root, lines_cache=None):
+    """io-id / chat-key -> character codename, read off the quest list's CHAR_INTR/CHAT fields."""
+    if lines_cache is None:
+        lines_cache = {}
+    io_to_char, chat_to_char = {}, {}
+
+    for path in _iter_rpy_files(source_root):
+        lines = _read_lines(path, lines_cache)
+        if not lines:
+            continue
+        text = "".join(lines)
+        for m in CHAR_INTR_RE.finditer(text):
+            io_to_char.setdefault(m.group(2), m.group(1))
+        for m in CHAT_RE.finditer(text):
+            chat_to_char.setdefault(m.group(2), m.group(1))
+
+    return io_to_char, chat_to_char
+
+
+def _extract_call_str(node):
+    if isinstance(node, ast.Call) and node.args:
+        arg = node.args[0]
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            return arg.value
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _walk_chat_items(items, inherited_sender, out):
+    """CHOICES entries have no SENDER of their own - they inherit the parent's."""
+    for item in items:
+        if not isinstance(item, ast.Dict):
+            continue
+        fields = {_node_to_str(k): v for k, v in zip(item.keys, item.values) if k is not None}
+
+        sender_node = fields.get("SENDER")
+        sender = _node_to_str(sender_node) if sender_node is not None else inherited_sender
+
+        content_node = fields.get("CONTENT")
+        if content_node is not None:
+            text = _extract_call_str(content_node)
+            if text:
+                extras = [f"{k}={_node_to_str(v)}" for k, v in fields.items()
+                          if k not in ("SENDER", "CONTENT", "TYPE", "CHOICES")]
+                hint = f"sender: {sender or '?'}"
+                if extras:
+                    hint += " | " + ", ".join(extras)
+                out.setdefault(text, hint)
+
+        choices_node = fields.get("CHOICES")
+        if isinstance(choices_node, ast.List):
+            _walk_chat_items(choices_node.elts, sender, out)
+
+
+def build_chat_hints(source_root, lines_cache=None):
+    """message text -> "sender: X | field=val, ..." for <cat>["key"] = [...] chat lists."""
+    if lines_cache is None:
+        lines_cache = {}
+    text_hints = {}
+
+    for path in _iter_rpy_files(source_root):
+        lines = _read_lines(path, lines_cache)
+        if not lines:
+            continue
+
+        i = 0
+        while i < len(lines):
+            if not CHAT_CATALOGUE_ASSIGN_RE.match(lines[i]):
+                i += 1
+                continue
+
+            chunk, i = _collect_bracketed_chunk(lines, i)
+            rhs = "".join(chunk).split('=', 1)[1]
+            try:
+                tree = ast.parse(rhs.strip(), mode='eval')
+            except SyntaxError:
+                continue
+            if isinstance(tree.body, ast.List):
+                _walk_chat_items(tree.body.elts, None, text_hints)
+
+    return text_hints
+
+
+def build_hints(source_root, lines_cache=None):
+    conditions = build_catalogue_conditions(source_root, lines_cache)
+    io_to_char, chat_to_char = build_character_index(source_root, lines_cache)
+    characters = {**io_to_char, **chat_to_char}
+    text_hints = build_chat_hints(source_root, lines_cache)
+    return conditions, characters, text_hints
