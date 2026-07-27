@@ -223,12 +223,13 @@ def build_chat_hints(source_root, lines_cache=None):
 
 # sm_quest_list = {...}  (first definition)  /  sm_quest_list.update({...})  (later files)
 QUEST_LIST_RE = re.compile(r'^\s*sm_quest_list(?:\s*=\s*\{|\.update\(\{)\s*$')
+VN_MODE_DATA_RE = re.compile(r'^\s*VN_MODE_DATA\s*=\s*\{\s*$')
 
 
 def _collect_translatable_strings(node, out):
-    """Recursively pulls every `_("...")` literal out of a quest entry's value -
-    handles a plain string HINT, a dict of variant hints, and the
-    ("hint_id", [...]) tuple-of-variants form, all the same way."""
+    """Recursively pulls every `_("...")` literal out of an entry's value -
+    handles a plain string field, a dict of variants, and a
+    ("id", [...]) tuple-of-variants form, all the same way."""
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == '_' and node.args:
         arg = node.args[0]
         if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
@@ -242,15 +243,24 @@ def _collect_translatable_strings(node, out):
             _collect_translatable_strings(e, out)
 
 
-def build_quest_hints(source_root, lines_cache=None):
+def _has_translatable(node):
+    """True if this field's own value contains a `_("...")` anywhere - used to
+    keep it out of the conditions summary, since it's already shown as the
+    translated line itself (a field can hold text without being called HINT
+    or NAME specifically, e.g. TRANSITION_TEXT)."""
+    found = []
+    _collect_translatable_strings(node, found)
+    return bool(found)
+
+
+def build_dict_text_hints(source_root, lines_cache, assign_re, id_label):
     """
-    HINT (and MAP_HINT etc.) text -> "quest: Q-XXX | STORY_LINE=..., EVENT=...".
-    Quest entries are often one giant single line, so there's no dict-key-opener
-    to anchor on the way there is for the catalogues - matched by the literal
-    string text instead, same idea as build_chat_hints.
+    Text -> "<id_label>: <key> | FIELD=val, ...", for any `NAME = {"key": {...},
+    ...}` (or `NAME.update({...})`) dict-of-dicts. Entries in these catalogues
+    are frequently a single line with no dict-key-opener to anchor on the way
+    interaction_*_options.rpy has, so this matches by the literal string text
+    instead - same idea as build_chat_hints.
     """
-    if lines_cache is None:
-        lines_cache = {}
     text_hints = {}
 
     for path in _iter_rpy_files(source_root):
@@ -260,7 +270,7 @@ def build_quest_hints(source_root, lines_cache=None):
 
         i = 0
         while i < len(lines):
-            if not QUEST_LIST_RE.match(lines[i]):
+            if not assign_re.match(lines[i]):
                 i += 1
                 continue
 
@@ -277,10 +287,10 @@ def build_quest_hints(source_root, lines_cache=None):
             for k, v in zip(tree.body.keys, tree.body.values):
                 if k is None or not isinstance(v, ast.Dict):
                     continue
-                quest_id = _node_to_str(k)
+                entry_id = _node_to_str(k)
                 extras = [f"{_node_to_str(fk)}={_node_to_str(fv)}" for fk, fv in zip(v.keys, v.values)
-                          if fk is not None and _node_to_str(fk) != "HINT"]
-                conditions = f"quest: {quest_id}"
+                          if fk is not None and not _has_translatable(fv)]
+                conditions = f"{id_label}: {entry_id}"
                 if extras:
                     conditions += " | " + ", ".join(extras)
 
@@ -292,10 +302,41 @@ def build_quest_hints(source_root, lines_cache=None):
     return text_hints
 
 
+def build_quest_hints(source_root, lines_cache=None):
+    if lines_cache is None:
+        lines_cache = {}
+    return build_dict_text_hints(source_root, lines_cache, QUEST_LIST_RE, "quest")
+
+
+def build_vn_mode_hints(source_root, lines_cache=None):
+    if lines_cache is None:
+        lines_cache = {}
+    return build_dict_text_hints(source_root, lines_cache, VN_MODE_DATA_RE, "scene")
+
+
+def _merge_text_hints(*sources):
+    """
+    The same string can legitimately show up in more than one catalogue (e.g. a
+    quest's HINT text matching the NAME of the scene it points to) - combine
+    both instead of letting whichever source runs last silently win.
+    """
+    merged = {}
+    for src in sources:
+        for text, hint in src.items():
+            if text not in merged:
+                merged[text] = hint
+            elif hint not in merged[text]:
+                merged[text] = f"{merged[text]} || {hint}"
+    return merged
+
+
 def build_hints(source_root, lines_cache=None):
     conditions = build_catalogue_conditions(source_root, lines_cache)
     io_to_char, chat_to_char = build_character_index(source_root, lines_cache)
     characters = {**io_to_char, **chat_to_char}
-    text_hints = build_chat_hints(source_root, lines_cache)
-    text_hints.update(build_quest_hints(source_root, lines_cache))
+    text_hints = _merge_text_hints(
+        build_chat_hints(source_root, lines_cache),
+        build_quest_hints(source_root, lines_cache),
+        build_vn_mode_hints(source_root, lines_cache),
+    )
     return conditions, characters, text_hints
