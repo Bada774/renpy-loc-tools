@@ -221,9 +221,81 @@ def build_chat_hints(source_root, lines_cache=None):
     return text_hints
 
 
+# sm_quest_list = {...}  (first definition)  /  sm_quest_list.update({...})  (later files)
+QUEST_LIST_RE = re.compile(r'^\s*sm_quest_list(?:\s*=\s*\{|\.update\(\{)\s*$')
+
+
+def _collect_translatable_strings(node, out):
+    """Recursively pulls every `_("...")` literal out of a quest entry's value -
+    handles a plain string HINT, a dict of variant hints, and the
+    ("hint_id", [...]) tuple-of-variants form, all the same way."""
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == '_' and node.args:
+        arg = node.args[0]
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            out.append(arg.value)
+        return
+    if isinstance(node, ast.Dict):
+        for v in node.values:
+            _collect_translatable_strings(v, out)
+    elif isinstance(node, (ast.List, ast.Tuple)):
+        for e in node.elts:
+            _collect_translatable_strings(e, out)
+
+
+def build_quest_hints(source_root, lines_cache=None):
+    """
+    HINT (and MAP_HINT etc.) text -> "quest: Q-XXX | STORY_LINE=..., EVENT=...".
+    Quest entries are often one giant single line, so there's no dict-key-opener
+    to anchor on the way there is for the catalogues - matched by the literal
+    string text instead, same idea as build_chat_hints.
+    """
+    if lines_cache is None:
+        lines_cache = {}
+    text_hints = {}
+
+    for path in _iter_rpy_files(source_root):
+        lines = _read_lines(path, lines_cache)
+        if not lines:
+            continue
+
+        i = 0
+        while i < len(lines):
+            if not QUEST_LIST_RE.match(lines[i]):
+                i += 1
+                continue
+
+            chunk, i = _collect_bracketed_chunk(lines, i)
+            text = "".join(chunk)
+            try:
+                rhs = text[text.index('{'):text.rindex('}') + 1]
+                tree = ast.parse(rhs, mode='eval')
+            except (ValueError, SyntaxError):
+                continue
+            if not isinstance(tree.body, ast.Dict):
+                continue
+
+            for k, v in zip(tree.body.keys, tree.body.values):
+                if k is None or not isinstance(v, ast.Dict):
+                    continue
+                quest_id = _node_to_str(k)
+                extras = [f"{_node_to_str(fk)}={_node_to_str(fv)}" for fk, fv in zip(v.keys, v.values)
+                          if fk is not None and _node_to_str(fk) != "HINT"]
+                conditions = f"quest: {quest_id}"
+                if extras:
+                    conditions += " | " + ", ".join(extras)
+
+                strings = []
+                _collect_translatable_strings(v, strings)
+                for s in strings:
+                    text_hints.setdefault(s, conditions)
+
+    return text_hints
+
+
 def build_hints(source_root, lines_cache=None):
     conditions = build_catalogue_conditions(source_root, lines_cache)
     io_to_char, chat_to_char = build_character_index(source_root, lines_cache)
     characters = {**io_to_char, **chat_to_char}
     text_hints = build_chat_hints(source_root, lines_cache)
+    text_hints.update(build_quest_hints(source_root, lines_cache))
     return conditions, characters, text_hints
